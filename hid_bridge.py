@@ -42,7 +42,7 @@ class NoHidCodeError(RuntimeError):
 
 class SimKeyEvent(object):
     def __init__(self, scancode, keystate):
-        self.scancode = scancode,
+        self.scancode = scancode
         self.keystate = keystate
 
 
@@ -59,7 +59,7 @@ def kb_hid_code(scancode):
     try:
         return codes.HIDCODES[name]
     except KeyError:
-        raise NoHidCodeError("No HID code for {} ({})".format(name, scancode))
+        raise NoHidCodeError("No HID code for key '{}' ({})".format(name, scancode))
 
 
 def kb_key_name(scancode, default=None):
