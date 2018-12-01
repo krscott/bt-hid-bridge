@@ -1,12 +1,13 @@
 #!python
 
 from __future__ import print_function
+import re
 import struct
+import sys
 import threading
 import time
 import traceback
 from Queue import Queue
-import sys
 
 import evdev
 
@@ -16,7 +17,7 @@ import codes
 ## Constants
 
 # Stop the program when handler raises an error
-HALT_ON_ERROR = True
+HALT_ON_ERROR = False
 
 
 # Backup if evdev.ecodes.KEY is ambiguous
@@ -64,15 +65,13 @@ def kb_hid_code(scancode):
 
 def kb_key_name(scancode, default=None):
     try:
-        name = evdev.ecodes.KEY[scancode]
-
-        if not isinstance(name, str):
-            print("Ambiguous scancode {}: {}".format(scancode, name))
-            name = KB_KEYS[scancode]
+        name = KB_KEYS[scancode]
+        #name = evdev.ecodes.KEY[scancode]
 
         return name
 
     except KeyError:
+        print("Unknown scancode: {}".format(scancode))
         return default
 
 
@@ -89,13 +88,17 @@ def kb_report(state):
 
     return struct.pack("BBBBBBBB", or_values(state["kb_mods"]), 0, *state["kb_keys"])
 
+
 def kb_state():
     return {
         # Keys currently pressed
         "kb_keys": [0] * 6,
 
         # Modifier keys
-        "kb_mods": {k: 0 for k in KB_MOD_HID_MASK.keys()}
+        "kb_mods": {k: 0 for k in KB_MOD_HID_MASK.keys()},
+
+        # Input translation mode
+        "input_translation": None
     }
 
 
@@ -121,7 +124,6 @@ def kbh_basic(queue, state, data):
         # Key down
         if hk in KB_MOD_HID_MASK:
             state["kb_mods"][hk] = KB_MOD_HID_MASK[hk]
-            print(state["kb_mods"])
 
         state["kb_keys"].pop()
         state["kb_keys"].insert(0, hk)
@@ -139,27 +141,303 @@ def kbh_basic(queue, state, data):
         # Key held
         pass
 
-    if data.keystate != 2:
-        print(
-            "Key: {}, Scan: {}, HID: {}, State: {}, Mods: 0x{:x}, Keys: {}".format(
-                kb_key_name(data.scancode, "???"), data.scancode, hk,
-                data.keystate, or_values(state["kb_mods"]), state["kb_keys"]
-            )
-        )
+    #if data.keystate != 2:
+    #    print(
+    #        "Key: {}, Scan: {}, HID: {}, State: {}, Mods: 0x{:x}, Keys: {}".format(
+    #            kb_key_name(data.scancode, "???"), data.scancode, hk,
+    #            data.keystate, or_values(state["kb_mods"]), state["kb_keys"]
+    #        )
+    #    )
 
     queue.put(kb_report(state))
 
 
-def kbh_test(queue, state, data):
+class WatchdogTimeout(RuntimeError):
+    pass
+
+
+class QuitInputMode(Exception):
+    pass
+
+
+class InputYoutube(object):
+    LAYOUT_SWAP = "<swap>"
+
+    @staticmethod
+    def shift_layout_key(key):
+        return "+{}".format(key)
+
+    @classmethod
+    def create_layout(cls, layout_map):
+        char2keyname = {
+            "a": cls.LAYOUT_SWAP,
+            "b": "KEY_BACKSPACE",
+            "c": "KEY_DELETE",  # Clear all
+            "s": "KEY_SPACE",
+            "e": "KEY_ENTER",
+            "-": "KEY_MINUS",
+            "'": "KEY_APOSTROPHE",
+            "&": "+KEY_7",
+            "#": "+KEY_3",
+            "(": "+KEY_9",
+            ")": "+KEY_0",
+            "@": "+KEY_2",
+            "!": "+KEY_1",
+            "?": "+KEY_SLASH",
+            ":": "+KEY_SEMICOLON",
+            ".": "KEY_DOT",
+            "_": "+KEY_MINUS",
+            '"': "+KEY_APOSTROPHE",
+        }
+
+        out = {
+            "rows": len(layout_map),
+            "cols": 0
+        }
+
+        for y, row in enumerate(layout_map):
+            for x, ch in enumerate(row):
+                out["cols"] = max(out["cols"], len(row))
+
+                pt = {
+                    "x": x,
+                    "y": y
+                }
+                if ch == " ":
+                    # Unused button, ignore
+                    pass
+                elif ch in char2keyname:
+                    keyname = char2keyname[ch]
+
+                    if keyname.startswith("+"):
+                        layout_key = cls.shift_layout_key(codes.SCANCODES.get(keyname[1:]))
+                    else:
+                        layout_key = codes.SCANCODES.get(keyname)
+
+                    # If scancode doesn't exist, just use char2keyname value as key
+                    out[layout_key or keyname] = pt
+
+                elif re.match(r'[A-Z0-9]', ch):
+                    sc = codes.SCANCODES["KEY_{}".format(ch)]
+
+                    # Add lower and upper case keys
+                    out[sc] = pt
+                    out["+{}".format(sc)] = pt
+                else:
+                    print("Unknown layout char: {}".format(ch))
+                    #raise RuntimeError("Unknown layout char: {}".format(ch))
+
+        return out
+
+
+    def __init__(self, queue):
+        self.__watchdog = 0
+
+        self._layout = self.create_layout([
+            "ABCDEFGb",
+            "HIJKLMNa",
+            "OPQRSTU",
+            "VWXYZ-'",
+            "sce",
+        ])
+
+        self._layout_alt = self.create_layout([
+            "123&#()b",
+            "456@!?:a",
+            "7890._\"",
+            "sc ",
+        ])
+
+        self._quit_keys = [codes.SCANCODES[k] for k in
+            ("KEY_UP", "KEY_DOWN", "KEY_LEFT", "KEY_RIGHT", "KEY_ESC")
+        ]
+
+        self._x = 7
+        self._y = 0
+        self._shift = False
+
+        self.input_init(queue)
+
+    def _increment_watchdog(self):
+        self.__watchdog += 1
+        if self.__watchdog > 40:
+            raise WatchdogTimeout(
+                "Watchdog expired after {} keypresses".format(self.__watchdog))
+
+        if (self._x < 0 or self._y < 0 or self._x >= self._layout["cols"]
+                or self._y >= self._layout["rows"]):
+            raise RuntimeError(
+                "Position out of bounds: ({},{})".format(self._x, self._y))
+
+    def _reset_watchdog(self):
+        self.__watchdog = 0
+
+    def menu_up(self, queue, bump=False, delay=0.1):
+        self._increment_watchdog()
+        if not bump:
+            self._y -= 1
+        kb_sim_keypress(queue, codes.SCANCODES["KEY_UP"])
+        if delay:
+            time.sleep(delay)
+
+    def menu_down(self, queue, bump=False, delay=0.1):
+        self._increment_watchdog()
+        if not bump:
+            self._y += 1
+        kb_sim_keypress(queue, codes.SCANCODES["KEY_DOWN"])
+        if delay:
+            time.sleep(delay)
+
+    def menu_left(self, queue, bump=False, delay=0.1):
+        self._increment_watchdog()
+        if not bump:
+            self._x -= 1
+        kb_sim_keypress(queue, codes.SCANCODES["KEY_LEFT"])
+        if delay:
+            time.sleep(delay)
+
+    def menu_right(self, queue, bump=False, delay=0.1):
+        self._increment_watchdog()
+        if not bump:
+            self._x += 1
+        kb_sim_keypress(queue, codes.SCANCODES["KEY_RIGHT"])
+        if delay:
+            time.sleep(delay)
+
+    def menu_select(self, queue, target=None):
+        if target is not None:
+            tx = target["x"]
+            ty = target["y"]
+
+            #def debug_print_xy():
+            #    print("({},{}) -> ({},{})".format(self._x, self._y, tx, ty))
+
+            last_row = self._layout["rows"] - 1
+            last_col = self._layout["cols"] - 1
+
+            # If going to or from bottom row, always move to left side first
+            if self._y != ty and (self._y == last_row or ty == last_row):
+                while self._x > 0:
+                    self.menu_left(queue)
+
+            # If coming from the right-most column, always move left first
+            if self._x != tx and self._x == last_col:
+                self.menu_left(queue)
+
+            # Move to row
+            while self._y < ty:
+                self.menu_down(queue)
+            while self._y > ty:
+                self.menu_up(queue)
+
+            # Add an extra movement for safety
+            if self._y == 0:
+                self.menu_up(queue, True)
+
+            # Move to column
+            while self._x < tx:
+                self.menu_right(queue)
+            while self._x > tx:
+                self.menu_left(queue)
+
+            # Add an extra movement for safety
+            if self._x == last_col:
+                self.menu_right(queue, True)
+
+        self._increment_watchdog()
+        kb_sim_keypress(queue, codes.SCANCODES["KEY_ENTER"])
+        time.sleep(0.4)
+
+    def input_init(self, queue):
+        for x in xrange(10):
+            self.menu_up(queue, True)
+            self.menu_right(queue, True)
+
+    def input(self, queue, state, data):
+        if data.keystate == 0:
+            # Key-up
+
+            if (data.scancode == codes.SCANCODES["KEY_LEFTSHIFT"]
+                    or data.scancode == codes.SCANCODES["KEY_RIGHTSHIFT"]):
+                # Shift key is released
+                self._shift = False
+
+        elif data.keystate == 1:
+            # Key-down
+
+            if (data.scancode == codes.SCANCODES["KEY_LEFTSHIFT"]
+                    or data.scancode == codes.SCANCODES["KEY_RIGHTSHIFT"]):
+                # Shift key is pressed
+                self._shift = True
+
+            elif data.scancode in self._quit_keys:
+                # If any of these keys are used, then revert to default control
+                kbh_basic(queue, state, data)
+                raise QuitInputMode()
+
+            else:
+                self._reset_watchdog()
+
+                if self._shift:
+                    # Shift is pressed
+                    layout_key = self.shift_layout_key(data.scancode)
+                else:
+                    layout_key = data.scancode
+
+                if (layout_key not in self._layout) and (layout_key in self._layout_alt):
+                    # Select keyboard swap key
+                    self.menu_select(queue, self._layout[self.LAYOUT_SWAP])
+
+                    # Swap layout maps
+                    self._layout, self._layout_alt = self._layout_alt, self._layout
+
+                if layout_key in self._layout:
+                    self.menu_select(queue, self._layout[layout_key])
+
+                    # Searching will change x,y position, so just give up
+                    if data.scancode == codes.SCANCODES["KEY_ENTER"]:
+                        raise QuitInputMode()
+
+                else:
+                    # Key is not in layout
+                    print("Ignoring key: {} ({})".format(
+                        layout_key, kb_key_name(data.scancode)))
+                    #kbh_basic(queue, state, data)
+
+
+def kbh_tv_menu(queue, state, data):
 
     hk = kb_hid_code(data.scancode)
 
-    if data.keystate == 1 and hk == 69:
-        # Press arrow keys in a circle
-        kb_sim_keypress(queue, 108, 106, 103, 105)
+    if hk == codes.HIDCODES["KEY_VOLUMEUP"]:
+        if (data.keystate == 1):
+            state["input_translation"] = None
+            print("Input mode: Default")
+
+    elif hk == codes.HIDCODES["KEY_VOLUMEDOWN"]:
+        if (data.keystate == 1):
+            state["input_translation"] = InputYoutube(queue)
+            print("Input mode: Youtube")
 
     else:
-        kbh_basic(queue, state, data)
+
+        if state["input_translation"] is None:
+            kbh_basic(queue, state, data)
+
+        else:
+            try:
+                state["input_translation"].input(queue, state, data)
+            except QuitInputMode:
+                state["input_translation"] = None
+
+    #hk = kb_hid_code(data.scancode)
+
+    #if data.keystate == 1 and hk == 69:
+    #    # Press arrow keys in a circle
+    #    kb_sim_keypress(queue, 108, 106, 103, 105)
+
+    #else:
+    #    kbh_basic(queue, state, data)
 
 
 ## System Functions
@@ -250,6 +528,6 @@ def start_daemon(f, *args, **kwargs):
 if __name__ == "__main__":
     queue = Queue()
 
-    start_daemon(loop_read_input_device, queue, '/dev/input/event0', kbh_test)
+    start_daemon(loop_read_input_device, queue, '/dev/input/event0', kbh_tv_menu)
 
     loop_write_usb_hid(queue, '/dev/hidg0')
