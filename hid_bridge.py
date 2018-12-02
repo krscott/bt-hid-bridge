@@ -141,7 +141,7 @@ def kbh_basic(queue, state, data):
         # Key held
         pass
 
-    #if data.keystate != 2:
+    #if data.keystate == 1:
     #    print(
     #        "Key: {}, Scan: {}, HID: {}, State: {}, Mods: 0x{:x}, Keys: {}".format(
     #            kb_key_name(data.scancode, "???"), data.scancode, hk,
@@ -160,7 +160,7 @@ class QuitInputMode(Exception):
     pass
 
 
-class InputYoutube(object):
+class InputTranslator(object):
     LAYOUT_SWAP = "<swap>"
 
     @staticmethod
@@ -188,6 +188,13 @@ class InputYoutube(object):
             ".": "KEY_DOT",
             "_": "+KEY_MINUS",
             '"': "+KEY_APOSTROPHE",
+            '/': "KEY_SLASH",
+            ';': "KEY_SEMICOLON",
+            '*': "+KEY_8",
+            ',': "KEY_COMMA",
+            "%": "+KEY_5",
+            "$": "+KEY_4",
+            "+": "+KEY_EQUAL",
         }
 
         out = {
@@ -233,30 +240,20 @@ class InputYoutube(object):
     def __init__(self, queue):
         self.__watchdog = 0
 
-        self._layout = self.create_layout([
-            "ABCDEFGb",
-            "HIJKLMNa",
-            "OPQRSTU",
-            "VWXYZ-'",
-            "sce",
-        ])
-
-        self._layout_alt = self.create_layout([
-            "123&#()b",
-            "456@!?:a",
-            "7890._\"",
-            "sc ",
-        ])
+        self._layout = None  # Must be assigned by derivative class
+        self._layout_alt = {}
 
         self._quit_keys = [codes.SCANCODES[k] for k in
             ("KEY_UP", "KEY_DOWN", "KEY_LEFT", "KEY_RIGHT", "KEY_ESC")
         ]
 
-        self._x = 7
+        self._x = 0
         self._y = 0
         self._shift = False
 
-        self.input_init(queue)
+        self._delay = 0.1
+
+        self.init(queue)
 
     def _increment_watchdog(self):
         self.__watchdog += 1
@@ -272,86 +269,67 @@ class InputYoutube(object):
     def _reset_watchdog(self):
         self.__watchdog = 0
 
-    def menu_up(self, queue, bump=False, delay=0.1):
+    def menu_delay(self, delay=-1):
+        if delay == -1:
+            delay = self._delay
+        if delay:
+            time.sleep(delay)
+
+    def menu_up(self, queue, bump=False, delay=-1):
         self._increment_watchdog()
         if not bump:
             self._y -= 1
         kb_sim_keypress(queue, codes.SCANCODES["KEY_UP"])
-        if delay:
-            time.sleep(delay)
+        self.menu_delay()
 
-    def menu_down(self, queue, bump=False, delay=0.1):
+    def menu_down(self, queue, bump=False, delay=-1):
         self._increment_watchdog()
         if not bump:
             self._y += 1
         kb_sim_keypress(queue, codes.SCANCODES["KEY_DOWN"])
-        if delay:
-            time.sleep(delay)
+        self.menu_delay()
 
-    def menu_left(self, queue, bump=False, delay=0.1):
+    def menu_left(self, queue, bump=False, delay=-1):
         self._increment_watchdog()
         if not bump:
             self._x -= 1
         kb_sim_keypress(queue, codes.SCANCODES["KEY_LEFT"])
-        if delay:
-            time.sleep(delay)
+        self.menu_delay()
 
-    def menu_right(self, queue, bump=False, delay=0.1):
+    def menu_right(self, queue, bump=False, delay=-1):
         self._increment_watchdog()
         if not bump:
             self._x += 1
         kb_sim_keypress(queue, codes.SCANCODES["KEY_RIGHT"])
-        if delay:
-            time.sleep(delay)
+        self.menu_delay()
+
+    def menu_goto(self, queue, target):
+        tx = target["x"]
+        ty = target["y"]
+
+        # Move to row
+        while self._y < ty:
+            self.menu_down(queue)
+        while self._y > ty:
+            self.menu_up(queue)
+
+        # Move to column
+        while self._x < tx:
+            self.menu_right(queue)
+        while self._x > tx:
+            self.menu_left(queue)
 
     def menu_select(self, queue, target=None):
         if target is not None:
-            tx = target["x"]
-            ty = target["y"]
-
-            #def debug_print_xy():
-            #    print("({},{}) -> ({},{})".format(self._x, self._y, tx, ty))
-
-            last_row = self._layout["rows"] - 1
-            last_col = self._layout["cols"] - 1
-
-            # If going to or from bottom row, always move to left side first
-            if self._y != ty and (self._y == last_row or ty == last_row):
-                while self._x > 0:
-                    self.menu_left(queue)
-
-            # If coming from the right-most column, always move left first
-            if self._x != tx and self._x == last_col:
-                self.menu_left(queue)
-
-            # Move to row
-            while self._y < ty:
-                self.menu_down(queue)
-            while self._y > ty:
-                self.menu_up(queue)
-
-            # Add an extra movement for safety
-            if self._y == 0:
-                self.menu_up(queue, True)
-
-            # Move to column
-            while self._x < tx:
-                self.menu_right(queue)
-            while self._x > tx:
-                self.menu_left(queue)
-
-            # Add an extra movement for safety
-            if self._x == last_col:
-                self.menu_right(queue, True)
+            self.menu_goto(queue, target)
 
         self._increment_watchdog()
+        self.menu_delay()
         kb_sim_keypress(queue, codes.SCANCODES["KEY_ENTER"])
-        time.sleep(0.4)
+        self.menu_delay(self._delay * 4)
 
-    def input_init(self, queue):
-        for x in xrange(10):
-            self.menu_up(queue, True)
-            self.menu_right(queue, True)
+    def init(self, queue):
+        pass
 
     def input(self, queue, state, data):
         if data.keystate == 0:
@@ -405,19 +383,190 @@ class InputYoutube(object):
                     #kbh_basic(queue, state, data)
 
 
+class InputYoutube(InputTranslator):
+
+    def init(self, queue):
+        self._layout = self.create_layout([
+            "ABCDEFGb",
+            "HIJKLMNa",
+            "OPQRSTU",
+            "VWXYZ-'",
+            "sce",
+        ])
+
+        self._layout_alt = self.create_layout([
+            "123&#()b",
+            "456@!?:a",
+            '7890._"',
+            "sc ",
+        ])
+
+        self._x = 7
+        self._y = 0
+
+        for x in xrange(10):
+            self.menu_up(queue, True)
+            self.menu_right(queue, True)
+
+    def menu_goto(self, queue, target):
+        tx = target["x"]
+        ty = target["y"]
+
+        #def debug_print_xy():
+        #    print("({},{}) -> ({},{})".format(self._x, self._y, tx, ty))
+
+        last_row = self._layout["rows"] - 1
+        last_col = self._layout["cols"] - 1
+
+        # If going to or from bottom row, always move to left side first
+        if self._y != ty and (self._y == last_row or ty == last_row):
+            while self._x > 0:
+                self.menu_left(queue)
+
+        # If coming from the right-most column, always move left first
+        if self._x != tx and self._x == last_col:
+            self.menu_left(queue)
+
+        # Move to row
+        while self._y < ty:
+            self.menu_down(queue)
+        while self._y > ty:
+            self.menu_up(queue)
+
+        # Add an extra movement for safety
+        if self._y == 0:
+            self.menu_up(queue, True)
+
+        # Move to column
+        while self._x < tx:
+            self.menu_right(queue)
+        while self._x > tx:
+            self.menu_left(queue)
+
+        # Add an extra movement for safety
+        if self._x == last_col:
+            self.menu_right(queue, True)
+
+
+class InputHulu(InputTranslator):
+
+    def init(self, queue):
+        self._layout = self.create_layout([
+            "asABCDEFGHIJKLMNOPQRSTUVWXYZb"
+        ])
+
+        self._layout_alt = self.create_layout([
+            "as1234567890b"
+        ])
+
+        self._x = 15
+        self._y = 0
+
+    def menu_goto(self, queue, target):
+        tx = target["x"]
+
+        last_col = self._layout["cols"] - 1
+
+        is_target_left = tx < self._x
+        is_target_near = abs(tx - self._x) < (last_col + 1)*0.5
+
+        while self._x != tx:
+            if is_target_left != is_target_near:  # xor
+                self.menu_right(queue)
+            else:
+                self.menu_left(queue)
+
+            if self._x > last_col:
+                self._x = 0
+            if self._x < 0:
+                self._x = last_col
+
+
+class InputAmazonPrimeVideo(InputTranslator):
+
+    def init(self, queue):
+        self._layout = self.create_layout([
+            "QWERTYUIOPb",
+            "ASDFGHJKLac",
+            "ZXCVBNM s  "
+        ])
+
+        self._layout_alt = self.create_layout([
+            "1234567890b",
+            '-/:;()*&"ac',
+            ".,?!%$'@+# "
+        ])
+
+        self._x = 0
+        self._y = 0
+
+    def menu_goto(self, queue, target):
+        tx = target["x"]
+        ty = target["y"]
+
+        #def debug_print_xy():
+        #    print("({},{}) -> ({},{})".format(self._x, self._y, tx, ty))
+
+        last_row = self._layout["rows"] - 1
+        last_col = self._layout["cols"] - 1
+
+        # Move to row
+        while self._y < ty:
+            self.menu_down(queue)
+
+            # Account for long space bar (shift 1 to the left)
+            if self._y == 2 and (self._x == 7 or self._x == 9):
+                self._x -= 1
+
+        while self._y > ty:
+            self.menu_up(queue)
+
+        # Move to column (wraps)
+        is_target_left = tx < self._x
+        is_target_near = abs(tx - self._x) < (last_col + 1)*0.5
+
+        while self._x != tx:
+            if is_target_left != is_target_near:  # xor
+                self.menu_right(queue)
+
+                # Account for long space bar
+                if self._y == 2 and (self._x == 7 or self._x == 9):
+                    self._x += 1
+            else:
+                self.menu_left(queue)
+
+                # Account for long space bar
+                if self._y == 2 and (self._x == 7 or self._x == 9):
+                    self._x -= 1
+
+            if self._x > last_col:
+                self._x = 0
+            if self._x < 0:
+                self._x = last_col
+
+
+
 def kbh_tv_menu(queue, state, data):
 
-    hk = kb_hid_code(data.scancode)
-
-    if hk == codes.HIDCODES["KEY_VOLUMEUP"]:
+    if data.scancode == codes.SCANCODES["KEY_VOLUMEUP"]:
         if (data.keystate == 1):
             state["input_translation"] = None
             print("Input mode: Default")
 
-    elif hk == codes.HIDCODES["KEY_VOLUMEDOWN"]:
+    elif data.scancode == codes.SCANCODES["KEY_VOLUMEDOWN"]:
         if (data.keystate == 1):
             state["input_translation"] = InputYoutube(queue)
             print("Input mode: Youtube")
+
+    elif data.scancode == codes.SCANCODES["KEY_MUTE"]:
+        if (data.keystate == 1):
+            state["input_translation"] = InputHulu(queue)
+            print("Input mode: Hulu")
+
+    elif data.scancode == codes.SCANCODES["KEY_NEXTSONG"]:
+        if (data.keystate == 1):
+            state["input_translation"] = InputAmazonPrimeVideo(queue)
+            print("Input mode: AmazonPrimeVideo")
 
     else:
 
