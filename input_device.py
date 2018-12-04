@@ -5,8 +5,6 @@ import time
 
 import evdev
 
-import codes
-
 
 class InputEvent(object):
     '''
@@ -100,7 +98,7 @@ if __name__  == "__main__":
     default_devpath = "/dev/input/event0"
 
     parser = argparse.ArgumentParser(description="Read keyboard input")
-    parser.add_argument("devpath", nargs="?", type=str,
+    parser.add_argument("-d", "--device", type=str,
         default=default_devpath,
         help="Path of input device (default: '{}')".format(default_devpath))
     args = parser.parse_args()
