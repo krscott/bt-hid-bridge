@@ -115,11 +115,11 @@ if __name__  == "__main__":
     }
 
     try:
-        for event in read_loop(args.devpath, print_func=print_stderr):
+        for event in read_loop(args.device, print_func=print_stderr):
             if event.is_key_event:
                 keystate_str = keystate_strings[event.keystate]
 
-                print("{: >14} ({: >4}) {: <4}  Active: {}".format(
+                print("{: <14} ({: >4}) {: <4}  Active: {}".format(
                     event.keyname, event.code, keystate_str, event.active_keys
                 ))
 
